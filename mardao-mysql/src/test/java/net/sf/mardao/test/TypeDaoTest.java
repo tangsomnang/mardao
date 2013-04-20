@@ -3,8 +3,11 @@ package net.sf.mardao.test;
 import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Date;
 import java.util.List;
 import javax.sql.DataSource;
+import static junit.framework.Assert.assertEquals;
+import static junit.framework.Assert.assertNull;
 import junit.framework.TestCase;
 import net.sf.mardao.core.CursorPage;
 import net.sf.mardao.core.dao.TypeDaoImpl;
@@ -113,12 +116,18 @@ public class TypeDaoTest extends TestCase {
         dao.persist(batch);
         DaoImpl.setPrincipalName(null);
         
-        Serializable cursorString = null;
+        String cursorString = null;
         CursorPage<Book, Long> page;
         for (int p = 0; p < 11; p++) {
             page = dao.queryPage(10, cursorString);
             LOG.info(String.format("queried page %d with cursor %s, got %d items", p, cursorString, page.getItems().size()));
             assertEquals("For page " + p, 10 == p ? 0 : 10, page.getItems().size());
+            if (null == cursorString) {
+                assertEquals(Integer.valueOf(100), page.getTotalSize());
+            }
+            else {
+                assertNull(page.getTotalSize());
+            }
             
             cursorString = page.getCursorKey();
         }
@@ -222,5 +231,30 @@ public class TypeDaoTest extends TestCase {
             count++;
         }
         assertEquals(51, count);
+    }
+    
+    public void testUpdate() {
+        final String NAME = "John Doe";
+        DaoImpl.setPrincipalName(NAME);
+        final Book expected = new Book();
+        expected.setTitle("Hello Galaxy");
+        dao.persist(expected);
+        assertNotNull(expected.getId());
+        assertNotNull(expected.getCreatedDate());
+        assertEquals(NAME, expected.getCreatedBy());
+        assertEquals(expected.getCreatedDate(), expected.getUpdatedDate());
+        assertEquals(NAME, expected.getUpdatedBy());
+        
+        final Date createdDate = expected.getCreatedDate();
+        DaoImpl.setPrincipalName("Jane Doe");
+        expected.setTitle("Updated Title");
+        dao.update(expected);
+        assertEquals(createdDate, expected.getCreatedDate());
+        assertEquals(NAME, expected.getCreatedBy());
+        assertTrue(createdDate.before(expected.getUpdatedDate()));
+        assertEquals("Jane Doe", expected.getUpdatedBy());
+        assertEquals("Updated Title", expected.getTitle());
+        
+        DaoImpl.setPrincipalName(null);
     }
 }

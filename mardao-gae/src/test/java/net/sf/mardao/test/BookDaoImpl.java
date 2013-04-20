@@ -1,5 +1,7 @@
 package net.sf.mardao.test;
 
+import com.google.appengine.api.datastore.DeleteContext;
+import com.google.appengine.api.datastore.PostDelete;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Date;
@@ -14,9 +16,11 @@ import net.sf.mardao.core.dao.TypeDaoImpl;
 public class BookDaoImpl extends TypeDaoImpl<Book, Long> {
     public static final String COLUMN_NAME_ID = "id";
     public static final String COLUMN_NAME_TITLE = "title";
+    public static final String COLUMN_NAME_APPARG0 = "appArg0";
     
     public static final Collection<String> COLUMN_NAMES = Arrays.asList(
-            COLUMN_NAME_TITLE
+            COLUMN_NAME_TITLE,
+            COLUMN_NAME_APPARG0
             );
 
     public BookDaoImpl() {
@@ -24,12 +28,20 @@ public class BookDaoImpl extends TypeDaoImpl<Book, Long> {
         this.memCacheAll = true;
         this.memCacheEntities = true;
     }
+    
+    @PostDelete(kinds = {"Book"})
+    void postDeleteCallback(DeleteContext context) {
+        doDeleteAuditCallback(context);
+    }
 
     @Override
     protected Object getDomainProperty(Book domain, String name) {
         Object value = null;
         if (COLUMN_NAME_TITLE.equals(name)) {
             value = domain.getTitle();
+        }
+        else if (COLUMN_NAME_APPARG0.equals(name)) {
+            value = domain.getAppArg0();
         }
         else {
             try {
@@ -48,10 +60,20 @@ public class BookDaoImpl extends TypeDaoImpl<Book, Long> {
         return queryIterable(false, 0, -1, null, null, null, false, null, false, filter);
     }
     
+    public Iterable<Book> queryByTitleAppArg0(String title, String appArg0) {
+        Filter filter0 = createEqualsFilter(COLUMN_NAME_TITLE, title);
+        Filter filter1 = createEqualsFilter(COLUMN_NAME_APPARG0, appArg0);
+        
+        return queryIterable(false, 0, -1, null, null, null, false, null, false, filter0, filter1);
+    }
+    
     @Override
     protected void setDomainProperty(Book domain, String name, Object value) {
         if (COLUMN_NAME_TITLE.equals(name)) {
             domain.setTitle(convertText(value));
+        }
+        else if (COLUMN_NAME_APPARG0.equals(name)) {
+            domain.setAppArg0(convertText(value));
         }
         else {
             super.setDomainProperty(domain, name, value);
@@ -77,6 +99,9 @@ public class BookDaoImpl extends TypeDaoImpl<Book, Long> {
             return Long.class;
         }
         if (COLUMN_NAME_TITLE.equals(columnName)) {
+            return String.class;
+        }
+        if (COLUMN_NAME_APPARG0.equals(columnName)) {
             return String.class;
         }
         if ("createdBy".equals(columnName) || "updatedBy".equals(columnName)) {

@@ -24,6 +24,7 @@ import net.sf.jsr107cache.CacheFactory;
 import net.sf.jsr107cache.CacheManager;
 import net.sf.mardao.core.CursorPage;
 import net.sf.mardao.core.Filter;
+import net.sf.mardao.core.MardaoListFuture;
 import net.sf.mardao.core.geo.DLocation;
 import net.sf.mardao.core.geo.Geobox;
 import org.slf4j.Logger;
@@ -60,6 +61,8 @@ public abstract class DaoImpl<T, ID extends Serializable,
 
     /** Using slf4j logging */
     protected static final Logger   LOG = LoggerFactory.getLogger(DaoImpl.class);
+    
+    protected static final String AUDIT_CURSOR_PREFIX = "audit-";
     
     private Collection<Integer> boxBits = Arrays.asList(
         Geobox.BITS_18_154m, Geobox.BITS_15_1224m, Geobox.BITS_12_10km
@@ -110,6 +113,12 @@ public abstract class DaoImpl<T, ID extends Serializable,
     
     /** inject to get different behavior */
     private static Map memCacheConfig = Collections.EMPTY_MAP;
+    
+    /**
+     * Set this to false in DaoBean constructor, to disable the count()
+     * query for first page (cursorKey is null).
+     */
+    protected boolean populateTotalSize = true;
 
     protected DaoImpl(Class<T> domainType, Class<ID> simpleIdType) {
         this.persistentClass = domainType;
@@ -140,6 +149,8 @@ public abstract class DaoImpl<T, ID extends Serializable,
     
     protected abstract T doFindByPrimaryKey(Object parentKey, ID simpleKeys);
     protected abstract Future<?> doFindByPrimaryKeyForFuture(Object parentKey, ID simpleKeys);
+    protected abstract Future<List<C>> doPersistCoreForFuture(Iterable<E> entities);
+    protected abstract Future<?> doPersistCoreForFuture(E core);
     protected abstract Iterable<T> doQueryByPrimaryKeys(Object parentKey, Iterable<ID> simpleKeys);
     
     protected abstract T findUniqueBy(Filter... filters);
@@ -153,7 +164,7 @@ public abstract class DaoImpl<T, ID extends Serializable,
             Object ancestorKey, Object primaryKey,
             String primaryOrderBy, boolean primaryIsAscending,
             String secondaryOrderBy, boolean secondaryIsAscending,
-            Serializable cursorString,
+            String cursorString,
             Filter... filters);
 
     /** Implemented in TypeDaoImpl */
@@ -195,6 +206,8 @@ public abstract class DaoImpl<T, ID extends Serializable,
     protected abstract void setCoreProperty(Object core, String name, Object value);
 
     protected abstract void setDomainStringProperty(T domain, String name, Map<String, String> properties);
+    
+    protected abstract CursorPage<ID, ID> whatsDeleted(Date since, int pageSize, String cursorKey);
     
     // --- END persistence-type beans must implement these ---
     
@@ -417,6 +430,16 @@ public abstract class DaoImpl<T, ID extends Serializable,
         ID id;
         for (E core : cores) {
             id = coreToSimpleKey(core);
+            ids.add(id);
+        }
+        return ids;
+    }
+
+    public Collection<ID> coreKeysToSimpleKeys(Iterable<C> cores) {
+        final Collection<ID> ids = new ArrayList<ID>();
+        ID id;
+        for (C core : cores) {
+            id = coreKeyToSimpleKey(core);
             ids.add(id);
         }
         return ids;
@@ -731,7 +754,9 @@ public abstract class DaoImpl<T, ID extends Serializable,
     public Future<?> findByPrimaryKeyForFuture(Object parentKey, ID simpleKey) {
         final T cached = getCachedByPrimaryKey(parentKey, simpleKey);
         if (null != cached) {
-            return new FutureTask(RUNNABLE_VOID, cached);
+            final FutureTask task = new FutureTask(RUNNABLE_VOID, cached);
+            task.run();
+            return task;
         }
         
         final Future<?> future = doFindByPrimaryKeyForFuture(parentKey, simpleKey);
@@ -774,17 +799,107 @@ public abstract class DaoImpl<T, ID extends Serializable,
     @Override
     public T getDomain(Future<?> future) {
         if (null != future) {
-        try {
-                final T domain = coreToDomain((E) future.get());
+            try {
+                final Object result = future.get();
+                if (null == result) {
+                    return null;
+                }
+                
+                // if it was found in cache, it will be the Domain object, not core Entity
+                if (this.persistentClass.equals(result.getClass())) {
+                    return (T) result;
+                }
+                
+                final T domain = coreToDomain((E) result);
                 if (memCacheEntities && null != domain) {
                     final Object parentKey = getParentKey(domain);
                     final ID simpleKey = getSimpleKey(domain);
                     putCachedByPrimaryKey(parentKey, simpleKey, domain);
                 }
+                return domain;
             } catch (InterruptedException ex) {
                 LOG.warn("Interrupted", ex);
             } catch (ExecutionException ex) {
-                LOG.warn("Executing", ex);
+                if (null == ex.getCause() ||
+                        !"com.google.appengine.api.datastore.EntityNotFoundException"
+                        .equals(ex.getCause().getClass().getName())) {
+                    LOG.warn("Executing", ex);
+                }
+            }
+        }
+        return null;
+    }
+
+    @Override
+    public ID getSimpleKey(Future<?> future) {
+        if (null != future) {
+            try {
+                final Object result = future.get();
+                if (null == result) {
+                    return null;
+                }
+                
+                // if it was found in cache, it will be the ID object, not core Key
+                if (this.simpleIdClass.equals(result.getClass())) {
+                    return (ID) result;
+                }
+                
+                final ID simpleKey = coreKeyToSimpleKey((C) result);
+                return simpleKey;
+            } catch (InterruptedException ex) {
+                LOG.warn("Interrupted", ex);
+            } catch (ExecutionException ex) {
+                if (null == ex.getCause() ||
+                        !"com.google.appengine.api.datastore.EntityNotFoundException"
+                        .equals(ex.getCause().getClass().getName())) {
+                    LOG.warn("Executing", ex);
+                }
+            }
+        }
+        return null;
+    }
+
+    @Override
+    public Collection<ID> getSimpleKeys(Future<List<?>> future) {
+        if (null != future) {
+            try {
+                final Object result = future.get();
+                if (null == result) {
+                    return null;
+                }
+                
+                List list = (List) result;
+                // return empty list
+                if (list.isEmpty()) {
+                    return list;
+                }
+                
+                // if it was found in cache, it will be the ID object, not core Key
+                Object first = list.get(0);
+                if (this.simpleIdClass.equals(first.getClass())) {
+                    return (Collection<ID>) list;
+                }
+                
+                final Collection<ID> simpleKeys = coreKeysToSimpleKeys(list);
+                
+                // populate keys on domains
+                if (future instanceof MardaoListFuture) {
+                    Iterable<T> domains = ((MardaoListFuture) future).getDomains();
+                    Iterator<ID> i = simpleKeys.iterator();
+                    for (T d : domains) {
+                        setSimpleKey(d, i.next());
+                    }
+                }
+                
+                return simpleKeys;
+            } catch (InterruptedException ex) {
+                LOG.warn("Interrupted", ex);
+            } catch (ExecutionException ex) {
+                if (null == ex.getCause() ||
+                        !"com.google.appengine.api.datastore.EntityNotFoundException"
+                        .equals(ex.getCause().getClass().getName())) {
+                    LOG.warn("Executing", ex);
+                }
             }
         }
         return null;
@@ -834,6 +949,26 @@ public abstract class DaoImpl<T, ID extends Serializable,
         final Iterable<ID> ids = persist(Arrays.asList(domain));
         final ID id = ids.iterator().hasNext() ? ids.iterator().next() : null;
         return id;
+    }
+    
+    @Override
+    public Future<?> persistForFuture(T domain) {
+        final Date currentDate = new Date();
+        LOG.debug("persistForFuture {}s", getTableName());
+        return doPersistCoreForFuture(domainToCore(domain, currentDate));
+    }
+    
+    @Override
+    public Future<List<?>> persistForFuture(Iterable<T> domains) {
+        final Date currentDate = new Date();
+        LOG.debug("persistForFuture {}s", getTableName());
+        ArrayList<E> entities = new ArrayList<E>();
+        for (T d : domains) {
+            entities.add(domainToCore(d, currentDate));
+        }
+        Future coreFuture = doPersistCoreForFuture(entities);
+        final MardaoListFuture returnValue = new MardaoListFuture(coreFuture, domains);
+        return returnValue;
     }
     
     public Iterable<T> queryAll() {
@@ -1012,7 +1147,7 @@ public abstract class DaoImpl<T, ID extends Serializable,
         return entities.values();
     }
     
-    public CursorPage<T, ID> queryPage(int pageSize, Serializable cursorString) {
+    public CursorPage<T, ID> queryPage(int pageSize, String cursorString) {
         return queryPage(false, pageSize, null, null,
                 null, false, null, false,
                 cursorString);
@@ -1020,7 +1155,7 @@ public abstract class DaoImpl<T, ID extends Serializable,
 
     public CursorPage<T, ID> queryPage(int pageSize, 
             String primaryOrderBy, boolean primaryIsAscending, String secondaryOrderBy, boolean secondaryIsAscending, 
-            Serializable cursorString) {
+            String cursorString) {
         return queryPage(false, pageSize, null, null,
                 primaryOrderBy, primaryIsAscending, secondaryOrderBy, secondaryIsAscending,
                 cursorString);
@@ -1028,7 +1163,7 @@ public abstract class DaoImpl<T, ID extends Serializable,
 
     public CursorPage<T, ID> queryInGeobox(float lat, float lng, int bits, int pageSize, 
             String primaryOrderBy, boolean primaryIsAscending, String secondaryOrderBy, boolean secondaryIsAscending, 
-            Serializable cursorString, Filter... filters) {
+            String cursorString, Filter... filters) {
         if (!boxBits.contains(bits)) {
             throw new IllegalArgumentException("Unboxed resolution, hashed are " + boxBits);
         }
@@ -1176,7 +1311,7 @@ public abstract class DaoImpl<T, ID extends Serializable,
      * @return the IDs for the entities with updatedDate >= since, in descending order.
      */
     @Override
-    public CursorPage<ID, ID> whatsChanged(Date since, int pageSize, Serializable cursorKey) {
+    public CursorPage<ID, ID> whatsChanged(Date since, int pageSize, String cursorKey) {
         return whatsChanged(null, since, pageSize, cursorKey);
     }
     
@@ -1187,21 +1322,45 @@ public abstract class DaoImpl<T, ID extends Serializable,
      */
     @Override
     public CursorPage<ID, ID> whatsChanged(Object parentKey, Date since, 
-            int pageSize, Serializable cursorKey, Filter... filters) {
+            int pageSize, String cursorKey, Filter... filters) {
         final String updatedDateColumnName = getUpdatedDateColumnName();
         if (null == updatedDateColumnName) {
             throw new UnsupportedOperationException("Not supported without @UpdatedDate");
         }
+        CursorPage<ID, ID> idPage = null;
+        String auditCursorKey = cursorKey;
         
-        Filter allFilters[] = Arrays.copyOf(filters, (null != filters ? filters.length : 0) + 1);
-        allFilters[allFilters.length-1] = createGreaterThanOrEqualFilter(updatedDateColumnName, since);
-        final CursorPage<T, ID> entityPage = queryPage(true, pageSize, parentKey, null, 
-                                  updatedDateColumnName, true, null, false, 
-                                  cursorKey, allFilters);
+        // start with returning updated IDs
+        if (null == cursorKey || !cursorKey.startsWith(AUDIT_CURSOR_PREFIX)) {
+            auditCursorKey = null;
+            Filter allFilters[] = Arrays.copyOf(filters, (null != filters ? filters.length : 0) + 1);
+            allFilters[allFilters.length-1] = createGreaterThanOrEqualFilter(updatedDateColumnName, since);
+            final CursorPage<T, ID> entityPage = queryPage(true, pageSize, parentKey, null, 
+                                      updatedDateColumnName, true, null, false, 
+                                      cursorKey, allFilters);
         
-        // convert entities to IDs only
-        final CursorPage<ID, ID> idPage = domainPageToSimplePage(entityPage);
+            // convert entities to IDs only
+            idPage = domainPageToSimplePage(entityPage);
+        }
         
+        // add all deleted IDs to last page
+        if (null == idPage || // audit cursor key
+                null == idPage.getCursorKey() || // no more udated items
+                idPage.getItems().size() < pageSize) { // incomplete updated page
+        
+            // full audit page or append to existing?
+            int remainingSize = null == idPage ? pageSize : 
+                    pageSize - idPage.getItems().size();
+            final CursorPage<ID, ID> deletedKeys = whatsDeleted(since, 
+                    remainingSize, auditCursorKey);
+            if (null == idPage) {
+                idPage = deletedKeys;
+            }
+            else {
+                idPage.getItems().addAll(deletedKeys.getItems());
+                idPage.setCursorKey(deletedKeys.getCursorKey());
+            }
+        }
         return idPage;
     }
 
